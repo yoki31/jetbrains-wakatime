@@ -28,19 +28,15 @@ import java.net.PasswordAuthentication;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.file.Files;
-import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.StandardCopyOption;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-
-import static java.nio.file.attribute.PosixFilePermission.*;
 
 class Response {
     public int statusCode;
@@ -59,6 +55,8 @@ public class Dependencies {
     private static String resourcesLocation = null;
     private static String cliVersion = null;
     private static Boolean alpha = null;
+    private static String originalProxyHost = null;
+    private static String originalProxyPort = null;
 
     public static String getResourcesLocation() {
         if (Dependencies.resourcesLocation != null) return Dependencies.resourcesLocation;
@@ -130,7 +128,7 @@ public class Dependencies {
         if (cliVersion != null) return cliVersion;
         String url = Dependencies.githubReleasesApiUrl();
         try {
-            Response resp = getUrlAsString(url, ConfigFile.get("internal", "cli_version_last_modified", true));
+            Response resp = getUrlAsString(url, ConfigFile.get("internal", "cli_version_last_modified", true), true);
             if (resp == null) {
                 cliVersion = ConfigFile.get("internal", "cli_version", true).trim();
                 WakaTime.log.debug("Using cached wakatime-cli version from config: " + cliVersion);
@@ -184,9 +182,11 @@ public class Dependencies {
             File outputDir = new File(getResourcesLocation());
             try {
                 unzip(zipFile, outputDir);
+                if (!isWindows()) {
+                    makeExecutable(getCLILocation());
+                }
                 File oldZipFile = new File(zipFile);
                 oldZipFile.delete();
-                if (!isWindows()) makeExecutable(getCLILocation());
             } catch (IOException e) {
                 WakaTime.log.warn(e);
             }
@@ -204,7 +204,8 @@ public class Dependencies {
             "freebsd-amd64",
             "freebsd-arm",
             "linux-386",
-            "linux-amd64", "linux-arm",
+            "linux-amd64",
+            "linux-arm",
             "linux-arm64",
             "netbsd-386",
             "netbsd-amd64",
@@ -223,7 +224,7 @@ public class Dependencies {
     private static void reportMissingPlatformSupport(String osname, String architecture) {
         String url = "https://api.wakatime.com/api/v1/cli-missing?osname=" + osname + "&architecture=" + architecture + "&plugin=" + WakaTime.IDE_NAME;
         try {
-            getUrlAsString(url, null);
+            getUrlAsString(url, null, false);
         } catch (Exception e) {
             WakaTime.log.warn(e);
         }
@@ -250,6 +251,8 @@ public class Dependencies {
 
         WakaTime.log.debug("DownloadFile(" + downloadUrl.toString() + ")");
 
+        setupProxy();
+
         ReadableByteChannel rbc = null;
         FileOutputStream fos = null;
         try {
@@ -257,6 +260,7 @@ public class Dependencies {
             fos = new FileOutputStream(saveAs);
             fos.getChannel().transferFrom(rbc, 0, Long.MAX_VALUE);
             fos.close();
+            teardownProxy();
             return true;
         } catch (RuntimeException e) {
             WakaTime.log.warn(e);
@@ -276,6 +280,7 @@ public class Dependencies {
                 }
                 inputStream.close();
                 fos.close();
+                teardownProxy();
                 return true;
             } catch (NoSuchAlgorithmException e1) {
                 WakaTime.log.warn(e1);
@@ -283,15 +288,20 @@ public class Dependencies {
                 WakaTime.log.warn(e1);
             } catch (IOException e1) {
                 WakaTime.log.warn(e1);
+            } catch (IllegalArgumentException e1) {
+                WakaTime.log.warn(e1);
+            } catch (Exception e1) {
+                WakaTime.log.warn(e1);
             }
         } catch (IOException e) {
             WakaTime.log.warn(e);
         }
 
+        teardownProxy();
         return false;
     }
 
-    public static Response getUrlAsString(String url, @Nullable String lastModified) {
+    public static Response getUrlAsString(String url, @Nullable String lastModified, boolean updateLastModified) {
         StringBuilder text = new StringBuilder();
 
         URL downloadUrl = null;
@@ -303,6 +313,8 @@ public class Dependencies {
 
         WakaTime.log.debug("getUrlAsString(" + downloadUrl.toString() + ")");
 
+        setupProxy();
+
         String responseLastModified = null;
         int statusCode = -1;
         try {
@@ -312,14 +324,17 @@ public class Dependencies {
                 conn.setRequestProperty("If-Modified-Since", lastModified.trim());
             }
             statusCode = conn.getResponseCode();
-            if (statusCode == 304) return null;
+            if (statusCode == 304) {
+                teardownProxy();
+                return null;
+            }
             InputStream inputStream = downloadUrl.openStream();
             byte[] buffer = new byte[4096];
             while (inputStream.read(buffer) != -1) {
                 text.append(new String(buffer, "UTF-8"));
             }
             inputStream.close();
-            if (conn.getResponseCode() == 200) responseLastModified = conn.getHeaderField("Last-Modified");
+            if (updateLastModified && conn.getResponseCode() == 200) responseLastModified = conn.getHeaderField("Last-Modified");
         } catch (RuntimeException e) {
             WakaTime.log.warn(e);
             try {
@@ -333,14 +348,17 @@ public class Dependencies {
                     conn.setRequestProperty("If-Modified-Since", lastModified.trim());
                 }
                 statusCode = conn.getResponseCode();
-                if (statusCode == 304) return null;
+                if (statusCode == 304) {
+                    teardownProxy();
+                    return null;
+                }
                 InputStream inputStream = conn.getInputStream();
                 byte[] buffer = new byte[4096];
                 while (inputStream.read(buffer) != -1) {
                     text.append(new String(buffer, "UTF-8"));
                 }
                 inputStream.close();
-                if (conn.getResponseCode() == 200) responseLastModified = conn.getHeaderField("Last-Modified");
+                if (updateLastModified && conn.getResponseCode() == 200) responseLastModified = conn.getHeaderField("Last-Modified");
             } catch (NoSuchAlgorithmException e1) {
                 WakaTime.log.warn(e1);
             } catch (KeyManagementException e1) {
@@ -349,6 +367,10 @@ public class Dependencies {
                 WakaTime.log.warn(e1);
             } catch (IOException e1) {
                 WakaTime.log.warn(e1);
+            } catch (IllegalArgumentException e1) {
+                WakaTime.log.warn(e1);
+            } catch (Exception e1) {
+                WakaTime.log.warn(e1);
             }
         } catch (UnknownHostException e) {
             WakaTime.log.warn(e);
@@ -356,13 +378,16 @@ public class Dependencies {
             WakaTime.log.warn(e);
         }
 
+        teardownProxy();
         return new Response(statusCode, text.toString(), responseLastModified);
     }
 
     /**
      * Configures a proxy if one is set in ~/.wakatime.cfg.
      */
-    public static void configureProxy() {
+    private static void setupProxy() {
+        originalProxyHost = System.getProperty("https.proxyHost");
+        originalProxyPort = System.getProperty("https.proxyPort");
         String proxyConfig = ConfigFile.get("settings", "proxy", false);
         if (proxyConfig != null && !proxyConfig.trim().equals("")) {
             try {
@@ -388,6 +413,11 @@ public class Dependencies {
                 WakaTime.log.error("Proxy string must follow https://user:pass@host:port format: " + proxyConfig);
             }
         }
+    }
+
+    private static void teardownProxy() {
+        if (originalProxyHost != null) System.setProperty("https.proxyHost", originalProxyHost);
+        if (originalProxyPort != null) System.setProperty("https.proxyPort", originalProxyPort);
     }
 
     private static void unzip(String zipFile, File outputDir) throws IOException {
@@ -422,10 +452,10 @@ public class Dependencies {
 
     private static void recursiveDelete(File path) {
         if(path.exists()) {
-            if (path.isDirectory()) {
+            if (isDirectory(path)) {
                 File[] files = path.listFiles();
                 for (int i = 0; i < files.length; i++) {
-                    if (files[i].isDirectory()) {
+                    if (isDirectory(files[i])) {
                         recursiveDelete(files[i]);
                     } else {
                         files[i].delete();
@@ -492,14 +522,54 @@ public class Dependencies {
 
     private static void makeExecutable(String filePath) throws IOException {
         File file = new File(filePath);
-        Set<PosixFilePermission> perms = new HashSet<>();
-        perms.add(OWNER_READ);
-        perms.add(OWNER_WRITE);
-        perms.add(OWNER_EXECUTE);
-        perms.add(GROUP_READ);
-        perms.add(GROUP_EXECUTE);
-        perms.add(OTHERS_READ);
-        perms.add(OTHERS_EXECUTE);
-        Files.setPosixFilePermissions(file.toPath(), perms);
+        try {
+            file.setExecutable(true);
+        } catch(SecurityException e) {
+            WakaTime.log.warn(e);
+        }
+    }
+
+    private static boolean isSymLink(File filepath) {
+        try {
+            return Files.isSymbolicLink(filepath.toPath());
+        } catch(SecurityException e) {
+            WakaTime.log.warn(e);
+            return false;
+        }
+    }
+
+    private static boolean isDirectory(File filepath) {
+        try {
+            return filepath.isDirectory();
+        } catch(SecurityException e) {
+            WakaTime.log.warn(e);
+            return false;
+        }
+    }
+
+    public static void createSymlink(String source, String destination) {
+        File sourceLink = new File(source);
+        if (isDirectory(sourceLink)) recursiveDelete(sourceLink);
+        if (!isWindows()) {
+            if (!isSymLink(sourceLink)) {
+                recursiveDelete(sourceLink);
+                try {
+                    Files.createSymbolicLink(sourceLink.toPath(), new File(destination).toPath());
+                } catch (Exception e) {
+                    WakaTime.log.warn(e);
+                    try {
+                        Files.copy(new File(destination).toPath(), sourceLink.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    } catch (Exception ex) {
+                        WakaTime.log.warn(ex);
+                    }
+                }
+            }
+        } else {
+            try {
+                Files.copy(new File(destination).toPath(), sourceLink.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            } catch (Exception e) {
+                WakaTime.log.warn(e);
+            }
+        }
     }
 }
